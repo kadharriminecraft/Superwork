@@ -1,0 +1,8 @@
+{
+  "name": "my-worker",
+  "version": "1.0.0",
+  "private": false,
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
