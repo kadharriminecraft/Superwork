@@ -68,11 +68,11 @@
      https://YOUR.WORKER/https://example.com/           (path style)
    ===================================================================== */
 
-const VERSION = '2.4';
+const VERSION = '2.5';
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const HOP_LIMIT = 10;
-const FETCH_TIMEOUT_MS = 30000;
+const FETCH_TIMEOUT_MS = 40000;
 
 /* Headers we never forward back to the browser (they break rendering or
    are meaningless through a proxy) */
@@ -104,7 +104,7 @@ const JAR_MAX_HOSTS = 60, JAR_MAX_PER_HOST = 40;
 
 /* ---- file-relay store (client bytes → real downloads) ---- */
 const FILES = new Map(); /* id -> { buf, ct, fn, exp } */
-const MAX_FILES = 12, MAX_FILE_BYTES = 80 * 1024 * 1024, FILE_TTL_MS = 10 * 60 * 1000;
+const MAX_FILES = 12, MAX_FILE_BYTES = 150 * 1024 * 1024, FILE_TTL_MS = 10 * 60 * 1000;
 
 function evictFiles() {
   const now = Date.now();
@@ -977,7 +977,7 @@ async function handle(req, event) {
       finalUrl = next;
       break;
     }
-    if (hops > HOP_LIMIT) return dlMode ? dlError(200, 'too many redirects (' + hops + ' hops)') : json(508, { error: 'too many redirects', hops: hops });
+    if (hops > HOP_LIMIT) { clearTimeout(timer); return dlMode ? dlError(200, 'too many redirects (' + hops + ' hops)') : json(508, { error: 'too many redirects', hops: hops }); }
   } catch (err) {
     clearTimeout(timer);
     /* dl-mode safety: Chrome RENDERS 4xx/5xx bodies as pages even when
@@ -989,7 +989,7 @@ async function handle(req, event) {
   clearTimeout(timer);
   /* upstream answered with an error while in dl-mode — same rule: never let
      the browser turn it into a navigation */
-  if (dlMode && res.status >= 400) return dlError(200, 'upstream ' + res.status + ' for this file — the link may be dead or the host blocks the proxy');
+  if (dlMode && res.status >= 400) { clearTimeout(timer); return dlError(200, 'upstream ' + res.status + ' for this file — the link may be dead or the host blocks the proxy'); }
 
   /* ---- burst-shield: stale-if-error for scripts/styles ----
      Bursty CDN edge nodes (nginx rate limiters, cheap shared hosts)
@@ -1005,7 +1005,11 @@ async function handle(req, event) {
     const isJsOrCss = /javascript|ecmascript|css/.test(ctb) || /\.(m?js|css)(\?|$)/i.test(new URL(finalUrl).pathname);
     if (isJsOrCss) {
       try {
-        const cached = await caches.default.match(stripRange(req));
+        /* v2.5: versioned asset key first; the plain stripRange() key stays
+           as a second lookup because TARGETLESS path requests use that same
+           key space for their site markers */
+        let cached = await caches.default.match(assetCacheKey(req));
+        if (!cached) cached = await caches.default.match(stripRange(req));
         if (cached) { clearTimeout(timer); res = cached; finalUrl = cached.headers.get('x-relay-final-url') || finalUrl; staleHit = true; }
       } catch (eStale) {}
     }
@@ -1085,7 +1089,7 @@ async function handle(req, event) {
     if (/^(image\/|font\/|audio\/|video\/)/.test(ct) || /\/(javascript|css)$/.test(ct)) {
       try {
         const cache = caches.default;
-        const cached = await cache.match(req);
+        const cached = await cache.match(assetCacheKey(req));
         if (cached) { clearTimeout(timer); hit = true; res = cached; finalUrl = cached.headers.get('x-relay-final-url') || finalUrl; }
         else { eventPut(cache, req, res, finalUrl, event); }
       } catch (e) { /* cache API unavailable — fine */ }
@@ -1157,16 +1161,37 @@ async function handle(req, event) {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers: out });
 }
 
-/* fire-and-forget cache write (stream-safe: clone, put in background) */
+/* fire-and-forget cache write (stream-safe: clone, put in background).
+   v2.5 CRITICAL FIX: the old code built `new Response(res.clone(), …)` — a
+   Response object is NOT a valid BodyInit, so the runtime stringified it to
+   the literal text "[object Response]" (17 bytes) and cached THAT as the
+   body. Every asset served from the edge cache was 17 bytes of junk with the
+   origin's own content-type — the "site looks bare-bones / CSS missing /
+   blank page" bug (jackbox.tv, tesla.com, intermittent everywhere). The
+   cached copy is now built from the CLONE'S BODY STREAM (a legal BodyInit)
+   so real bytes land in the cache. A version tag in the key orphans every
+   entry the old code poisoned (some origins sent year-long max-ages, so
+   stale junk could otherwise outlive the fix). */
+const CACHE_KEY_VER = 'rl2';
 function eventPut(cache, req, res, finalUrl, event) {
   try {
-    const copy = new Response(res.clone ? res.clone() : res.body, {
-      status: res.status, statusText: res.statusText, headers: res.headers
+    const cl = res.clone ? res.clone() : null;
+    const hdrs = new Headers(res.headers);
+    hdrs.set('x-relay-final-url', finalUrl);
+    const copy = new Response(cl ? cl.body : res.body, {
+      status: res.status, statusText: res.statusText, headers: hdrs
     });
-    copy.headers.set('x-relay-final-url', finalUrl);
-    const p = cache.put(stripRange(req), copy).catch(() => {});
+    const p = cache.put(assetCacheKey(req), copy).catch(() => {});
     if (event && event.waitUntil) { try { event.waitUntil(p); } catch (eW) {} }
   } catch (e) { /* ignore */ }
+}
+/* asset-cache key: ignores Range AND carries a version tag — the marker
+   cache (targetless /assets/... lookups) keeps using plain stripRange()
+   keys, so the two key spaces never collide. */
+function assetCacheKey(req) {
+  const u = new URL(req.url);
+  const key = u.origin + u.pathname + u.search + (u.search ? '&' : '?') + CACHE_KEY_VER;
+  return new Request(key, { method: 'GET' });
 }
 /* cache key ignores Range so a full copy can serve range requests */
 function stripRange(req) {
