@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "private": false,
   "devDependencies": {
-    "wrangler": "^3.0.0"
+    "wrangler": "4.129.0"
   }
 }
