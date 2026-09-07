@@ -68,7 +68,7 @@
      https://YOUR.WORKER/https://example.com/           (path style)
    ===================================================================== */
 
-const VERSION = '2.5';
+const VERSION = '2.6';
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const HOP_LIMIT = 10;
@@ -1060,6 +1060,25 @@ async function handle(req, event) {
                  exclusion prevents re-matching the patched output itself. */
               /(?<![.\w$:])location(\.(?:pathname|href|origin|hostname|hash|search|port|protocol|toString)\b)/g,
               '(window.__rlLoc?window.__rlLoc():location)$1'
+            ).replace(
+              /* v2.6: BARE (window|document).location captured as a VALUE — no
+                 member access follows, so the two rules above never fire.
+                 history v4/v5 (react-router's engine, in Spotify's vendor
+                 bundle) computes the app's INITIAL route exactly this way:
+                   var o = window.location, s = o.pathname + o.search + o.hash
+                 Inside the sandbox that reads about:srcdoc — no route
+                 matches — pathname-routed apps render their no-match
+                 fallback forever (Spotify's mobile web player showed the
+                 home feed on /search and never mounted the search view).
+                 Wrap the bare capture in the same __rlLoc fallback so the
+                 fake location — which tracks the real page URL and every
+                 shimmed pushState — is what routers capture. Exclusions:
+                 `.` member (rule 1's territory), identifier chars, `(`, and
+                 arithmetic/assignment ops (never a value read); the `:`
+                 lookbehind stops this rule from re-wrapping rule 1's own
+                 output (`…:window.location)`). */
+              /(?<![.\w$:])(?:window|document)\.location(?![.\w$(=+\-*%\[])/g,
+              '(window.__rlLoc?window.__rlLoc():window.location)'
             );
           }
           /* always rebuild: text() drained the original body */
