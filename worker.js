@@ -61,6 +61,11 @@
        the second time); X-Relay-NoCache: 1 skips the cache on demand
      - No shared rate limits — it is YOUR worker on YOUR quota
      - /__relay/health endpoint so Relay can auto-verify the connection
+     - v2.7: /__relay/apl — the APLMate (Apple Music) flow runs INSIDE one
+       invocation: session cookie + no-Turnstile JWT + track list + direct
+       cdndl mp3 links, all from one isolate so the site's ip+ua+session
+       binding stays consistent (separate invocations get different
+       Cloudflare egress IPs and the site rejects them)
 
    URL shapes accepted (all equivalent):
      https://YOUR.WORKER/?url=https://example.com/      (encoded or raw)
@@ -68,7 +73,7 @@
      https://YOUR.WORKER/https://example.com/           (path style)
    ===================================================================== */
 
-const VERSION = '2.6';
+const VERSION = '2.7';
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const HOP_LIMIT = 10;
@@ -401,6 +406,182 @@ function rlRetagCmafSeg(segBuf, oldId, newId){
   } catch (eRS){ return null; }
 }
 
+/* ---- APLMate flow (single invocation) ----------------------------------
+   Every helper here is LOCAL to one request: cookie string, UA, Referer all
+   thread through the chain inside the same invocation (see the route doc
+   above for why that binding matters). */
+const APL_UA = UA_MOBILE;
+function aplCookieFrom(res, prev) {
+  try {
+    let scs = [];
+    if (typeof res.headers.getSetCookie === 'function') scs = res.headers.getSetCookie() || [];
+    if (!scs.length) { const c = res.headers.get('set-cookie'); if (c) scs = [c]; }
+    if (!scs.length) return prev || '';
+    let jar = {};
+    String(prev || '').split(/;\s*/).filter(Boolean).forEach(function (p) {
+      const eq = p.indexOf('=');
+      if (eq > 0) jar[p.slice(0, eq)] = p.slice(eq + 1);
+    });
+    scs.forEach(function (raw) {
+      const kv = String(raw).split(';')[0];
+      const eq = kv.indexOf('=');
+      if (eq > 0) {
+        const k = kv.slice(0, eq);
+        const v = kv.slice(eq + 1);
+        if (v === '' || /^(deleted|)$/i.test(v)) delete jar[k]; /* expired */
+        else jar[k] = v;
+      }
+    });
+    return Object.keys(jar).map(function (k) { return k + '=' + jar[k]; }).join('; ');
+  } catch (eC) { return prev || ''; }
+}
+async function aplFetch(url, init, cookie) {
+  /* one upstream call with the site's session + referer + UA, following
+     redirects manually so Set-Cookie is captured at every hop.
+     Returns {res, cookie} — the caller keeps threading the jar. */
+  let next = url;
+  let res = null;
+  for (let hop = 0; hop <= 4; hop++) {
+    const headers = Object.assign({}, init.headers || {});
+    if (cookie) headers['cookie'] = cookie;
+    res = await fetch(next, Object.assign({}, init, { headers: headers, redirect: 'manual' }));
+    cookie = aplCookieFrom(res, cookie);
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) break;
+      try { next = new URL(loc, next).href; } catch (eL) { break; }
+      try { if (res.body) await res.body.cancel(); } catch (eB) {}
+      continue;
+    }
+    break;
+  }
+  return { res: res, cookie: cookie };
+}
+async function aplHandle(u) {
+  const url = (u.searchParams.get('url') || '').trim();
+  const trackIdx = parseInt(u.searchParams.get('track') || '-1', 10);
+  const maxEager = Math.max(1, Math.min(40, parseInt(u.searchParams.get('max') || '10', 10) || 10));
+  if (!/^https?:\/\/(music\.apple\.com|amp\.music\.apple\.com|embed\.music\.apple\.com)\//i.test(url)) {
+    return json(400, { ok: false, error: 'Not an Apple Music link — paste a music.apple.com URL' });
+  }
+  const B = 'https://aplmate.com';
+  let cookie = '';
+
+  /* 1. warmup — establish the session cookie */
+  let rr = await aplFetch(B + '/', { headers: { 'user-agent': APL_UA, accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'accept-language': 'en-US,en;q=0.9' } }, cookie);
+  cookie = rr.cookie;
+  if (!/session_data=/.test(cookie)) {
+    /* one retry — occasional 429/5xx blips at the edge */
+    await new Promise(function (res) { setTimeout(res, 600); });
+    rr = await aplFetch(B + '/', { headers: { 'user-agent': APL_UA, accept: 'text/html', 'accept-language': 'en-US,en;q=0.9' } }, cookie);
+    cookie = rr.cookie;
+    if (!/session_data=/.test(cookie)) return json(502, { ok: false, error: 'APLMate did not start a session (edge hiccup) — try again' });
+  }
+
+  /* 2. userverify — the no-Turnstile JWT mint */
+  let token = '';
+  for (let a = 0; a < 2 && !token; a++) {
+    if (a) await new Promise(function (res) { setTimeout(res, 700); });
+    rr = await aplFetch(B + '/action/userverify', {
+      method: 'POST',
+      headers: { 'user-agent': APL_UA, referer: B + '/', 'x-requested-with': 'XMLHttpRequest', 'content-type': 'application/x-www-form-urlencoded; charset=UTF-8', accept: '*/*' },
+      body: 'url=' + encodeURIComponent(url)
+    }, cookie);
+    cookie = rr.cookie;
+    try { token = (JSON.parse(await rr.res.text()) || {}).token || ''; } catch (eT) { token = ''; }
+  }
+  if (!token) return json(502, { ok: false, error: 'APLMate token mint failed — try again in a minute' });
+
+  /* 3. /action — the track list (multipart, exactly like the site's FormData XHR) */
+  let html = '', errMsg = '';
+  for (let a = 0; a < 2 && !html; a++) {
+    if (a) await new Promise(function (res) { setTimeout(res, 700); });
+    const fd = new FormData();
+    fd.append('url', url);
+    fd.append('cf-turnstile-response', token);
+    rr = await aplFetch(B + '/action', {
+      method: 'POST',
+      headers: { 'user-agent': APL_UA, referer: B + '/', accept: '*/*' },
+      body: fd
+    }, cookie);
+    cookie = rr.cookie;
+    try {
+      const j = JSON.parse(await rr.res.text());
+      if (j && j.html) html = String(j.html);
+      else if (j && j.message) errMsg = String(j.message);
+    } catch (eA) {}
+  }
+  if (!html) return json(502, { ok: false, error: errMsg || 'APLMate could not read that link' });
+
+  /* 4. parse the album header + every track form */
+  const tracks = [];
+  const formRe = /<form\s+name="submitapurl"[^>]*>([\s\S]*?)<\/form>/g;
+  let fm2;
+  while ((fm2 = formRe.exec(html)) !== null) {
+    const f = fm2[1];
+    const gv = function (n) {
+      const m = new RegExp('name="' + n + '" value=\'([^\']*)\'').exec(f);
+      return m ? m[1] : '';
+    };
+    let meta = {};
+    try { meta = JSON.parse(atob(gv('data'))) || {}; } catch (eD) {}
+    tracks.push({
+      i: tracks.length,
+      data: gv('data'), base: gv('base'), token: gv('token'),
+      name: String(meta.name || 'Track ' + (tracks.length + 1)).slice(0, 120),
+      artist: String(meta.artist || '').slice(0, 120),
+      album: String(meta.album || '').slice(0, 120),
+      cover: String(meta.cover || '').slice(0, 400),
+      duration: String(meta.duration || '').slice(0, 12),
+      mp3: ''
+    });
+  }
+  if (!tracks.length) return json(200, { ok: true, version: VERSION, album: { title: '', artist: '', cover: '' }, tracks: [], note: 'No downloadable tracks on that page' });
+  const headerTitle = (/<h3[^>]*itemprop="name"[^>]*>\s*<[^>]*title="([^"]+)"/.exec(html) || [])[1] || tracks[0].album || '';
+  const headerArtist = (/<p><span>([^<]+)\s*·/.exec(html) || [])[1] || tracks[0].artist || '';
+  const headerCover = (/(<img[^>]+class="[^"]*"[^>]*src=")(https:[^"]+)"/.exec(html) || [])[2] || tracks[0].cover || '';
+
+  /* 5. resolve track mp3 links — eager for the first N, or exactly the one asked for */
+  const want = trackIdx >= 0 ? [trackIdx] : tracks.map(function (t, i) { return i; }).slice(0, maxEager);
+  let deadStreak = 0;
+  for (const idx of want) {
+    if (idx >= tracks.length) continue;
+    const t = tracks[idx];
+    let got = false;
+    for (let a = 0; a < 2 && !got; a++) {
+      if (a) await new Promise(function (res) { setTimeout(res, 800); });
+      try {
+        const fd = new FormData();
+        fd.append('data', t.data);
+        fd.append('base', t.base);
+        fd.append('token', t.token);
+        rr = await aplFetch(B + '/action/track', {
+          method: 'POST',
+          headers: { 'user-agent': APL_UA, referer: B + '/', accept: '*/*' },
+          body: fd
+        }, cookie);
+        cookie = rr.cookie;
+        const j = JSON.parse(await rr.res.text());
+        if (j && j.data) {
+          const dl = String(j.data);
+          t.mp3 = (/href="(https:\/\/cdndl\.aplmate\.com\/mp3\?token=[^"]+)"/.exec(dl) || [])[1] || '';
+          got = !!t.mp3;
+        }
+      } catch (eTR) {}
+    }
+    deadStreak = got ? 0 : deadStreak + 1;
+    if (deadStreak >= 2) break; /* the site throttled this run — ship what we have */
+    await new Promise(function (res) { setTimeout(res, 350); }); /* polite spacing */
+  }
+  return json(200, {
+    ok: true,
+    version: VERSION,
+    album: { title: headerTitle.slice(0, 140), artist: headerArtist.slice(0, 140), cover: headerCover.slice(0, 400) },
+    tracks: tracks,
+    lazy: tracks.filter(function (t) { return !t.mp3; }).length
+  });
+}
+
 async function handle(req, event) {
   const u = new URL(req.url);
 
@@ -415,6 +596,32 @@ async function handle(req, event) {
         'x-relay-version': VERSION
       }
     });
+  }
+
+  /* ---- Apple Music grabber: GET /__relay/apl?url=<music.apple.com link>[&track=N][&max=M]
+     APLMate (aplmate.com) converts Apple Music links to mp3, but its flow is
+     session-BOUND: the token it issues embeds the requester's ip + user-agent
+     + session cookie, and every step must present all three CONSISTENTLY.
+     From the browser those steps would exit through different proxy IPs
+     (each netFetch races its own proxy), and even two calls to this worker
+     can land on different isolates with different egress IPs — so the only
+     reliable shape is the whole chain INSIDE ONE invocation, where the
+     isolate, the cookie, the UA and the egress IP all stay fixed. The
+     Turnstile front-gate is bypassed entirely: the site's own fallback
+     endpoint (/action/userverify) mints a signed JWT with no human-check
+     (it exists for browsers where Turnstile fails to load). Steps: warmup
+     (session cookie) -> userverify (JWT) -> /action (multipart, like the
+     site's FormData XHR; returns the track list) -> /action/track per song
+     (multipart; returns cdndl.aplmate.com/mp3?token= direct links, which are
+     URL-authenticated and work from ANY IP for 10h). The app then downloads
+     the mp3 through this worker's normal proxy path. Eager track resolution
+     is capped (subrequest limit ~50/invocation); the rest resolve lazily
+     via &track=N (which re-runs the cheap steps + one track call). */
+  if (u.pathname === '/__relay/apl') {
+    if (req.method === 'OPTIONS') return cors204(req);
+    try { return await aplHandle(u); } catch (eApl) {
+      return json(502, { ok: false, error: 'apl flow failed: ' + String((eApl && eApl.message) || eApl).slice(0, 160) });
+    }
   }
 
   /* ---- file relay: client-side bytes → real download ----
