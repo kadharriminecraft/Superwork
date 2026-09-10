@@ -66,6 +66,14 @@
        cdndl mp3 links, all from one isolate so the site's ip+ua+session
        binding stays consistent (separate invocations get different
        Cloudflare egress IPs and the site rejects them)
+     - v2.8: /__relay/sc — the SoundCloud flow, natively (no third-party
+       site). sclouddownloader.net's own backend has been dead for playlist
+       POSTs (its server cannot reach SoundCloud anymore — every submit ends
+       at /playlist-error), so Relay talks to api-v2.soundcloud.com itself:
+       client_id from the web bundles (cached per isolate), resolve the
+       pasted URL, hydrate stub tracks via /tracks?ids=, then resolve each
+       track's progressive transcoding into a signed cf-media mp3 link
+       (URL-authenticated, CORS-open, works from any IP incl. the phone)
 
    URL shapes accepted (all equivalent):
      https://YOUR.WORKER/?url=https://example.com/      (encoded or raw)
@@ -73,7 +81,7 @@
      https://YOUR.WORKER/https://example.com/           (path style)
    ===================================================================== */
 
-const VERSION = '2.7';
+const VERSION = '2.8';
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const HOP_LIMIT = 10;
@@ -582,6 +590,185 @@ async function aplHandle(u) {
   });
 }
 
+/* ---- SoundCloud native flow --------------------------------------------
+   No session binding at all (unlike APLMate): the client_id is a public
+   token baked into soundcloud.com's web bundles, and the transcoding
+   endpoint returns a SIGNED media URL that works from ANY ip/ua — so the
+   phone can even fetch the mp3 directly (the CDN sends CORS *). What MUST
+   stay inside one invocation is only the subrequest budget (~50 free
+   plan): client_id extraction (1-8) + resolve (1) + stub hydration (0-2)
+   + eager transcoding lookups (N). Eager default 24, hard cap 30; the
+   rest resolve lazily via &track=N which re-runs the cheap steps + ONE
+   transcoding lookup. */
+const SC_UA = UA_DESKTOP;   /* soundcloud.com 307s mobile UAs to m.soundcloud.com (no web bundles there) */
+const SC_API = 'https://api-v2.soundcloud.com';
+let SC_CID = { id: '', at: 0 };   /* per-isolate client_id cache */
+const SC_CID_TTL = 12 * 3600 * 1000;
+
+async function scJson(urlStr) {
+  const res = await fetch(urlStr, { headers: { 'user-agent': SC_UA, accept: 'application/json' }, redirect: 'manual' });
+  let body = '';
+  try { body = await res.text(); } catch (eB) {}
+  let j = null;
+  try { j = JSON.parse(body); } catch (eJ) {}
+  return { status: res.status, loc: res.headers.get('location') || '', j: j, res: res };
+}
+/* The public web token rotates every few weeks and Soundcloud keeps moving
+   it between build chunks (asset #9 today, #2 last week) — so the extraction
+   walks ALL bundles with a 3-wide pool that stops at the first hit, and a
+   last-known token is baked in as the cold-start fallback (when it goes
+   stale the resolve 401s and the force re-extract runs). */
+const SC_CID_FALLBACK = 'Pb72ranhoyt6gw7hM7TkzUItXlMWSNSo';
+async function scClientId(force) {
+  if (!force && SC_CID.id && (Date.now() - SC_CID.at) < SC_CID_TTL) return SC_CID.id;
+  let found = '';
+  try {
+    const home = await fetch('https://soundcloud.com/', { headers: { 'user-agent': SC_UA, accept: 'text/html' } });
+    const hp = await home.text().catch(function () { return ''; });
+    const assets = [];
+    const re = /https:\/\/a-v2\.sndcdn\.com\/assets\/[^"']+\.js/g;
+    let m;
+    while ((m = re.exec(hp)) !== null) assets.push(m[0]);
+    const queue = assets.slice(0, 12);
+    async function one() {
+      while (queue.length && !found) {
+        const a = queue.shift();
+        try {
+          const r = await fetch(a, { headers: { 'user-agent': SC_UA, accept: '*/*', referer: 'https://soundcloud.com/' } });
+          const t = await r.text();
+          const cm = /client_id\s*[:=]\s*"([0-9a-zA-Z]{28,40})"/.exec(t);
+          if (cm) found = cm[1];
+        } catch (eA2) {}
+      }
+    }
+    await Promise.all([one(), one(), one()]);
+  } catch (eH) {}
+  const cid = found || SC_CID_FALLBACK;
+  SC_CID = { id: cid, at: Date.now() };
+  return cid;
+}
+function scArt(u) {
+  return String(u || '').replace(/-(large|t\d+x\d+|badge|small|tiny|mini)\.(jpg|png)/i, '-t500x500.$2').slice(0, 500);
+}
+function scMediaUrlOf(tc, clientId) {
+  /* GET transcoding.url?client_id → 302 Location OR JSON {url} */
+  if (!tc || !tc.url || !/^https?:/i.test(tc.url)) return Promise.resolve('');
+  return scJson(tc.url + (tc.url.includes('?') ? '&' : '?') + 'client_id=' + clientId).then(function (r) {
+    if (r.loc) return r.loc;
+    if (r.j && r.j.url) return String(r.j.url);
+    return '';
+  }).catch(function () { return ''; });
+}
+function scTrackOut(t, i) {
+  const tcs = (t && t.media && t.media.transcodings) || [];
+  const prog = tcs.filter(function (x) { return x && x.format && x.format.protocol === 'progressive' && /audio\/mpeg/i.test(x.format.mime_type || ''); })[0] ||
+               tcs.filter(function (x) { return x && x.format && x.format.protocol === 'progressive'; })[0];
+  return {
+    i: i,
+    id: t.id,
+    title: String((t.title || '') || 'Track ' + (i + 1)).slice(0, 140),
+    artist: String((t.user && t.user.username) || '').slice(0, 120),
+    duration: Math.round((t.duration || 0) / 1000),
+    artwork: scArt(t.artwork_url),
+    permalink: String(t.permalink_url || '').slice(0, 300),
+    mp3: '',
+    hlsOnly: !prog && tcs.some(function (x) { return x && x.format && x.format.protocol === 'hls'; })
+  };
+}
+async function scHandle(u) {
+  const url = (u.searchParams.get('url') || '').trim();
+  const trackIdx = parseInt(u.searchParams.get('track') || '-1', 10);
+  const maxEager = Math.max(1, Math.min(30, parseInt(u.searchParams.get('max') || '24', 10) || 24));
+  if (!/^https?:\/\/([a-z0-9-]+\.)*soundcloud\.com\//i.test(url)) {
+    return json(400, { ok: false, error: 'Not a SoundCloud link — paste a soundcloud.com URL' });
+  }
+
+  /* 1. client_id (cached per isolate; re-extract once on auth failure) */
+  let clientId = await scClientId(false);
+  if (!clientId) return json(502, { ok: false, error: 'SoundCloud did not hand out its client token — try again in a minute' });
+
+  /* 2. resolve the pasted URL */
+  let r = await scJson(SC_API + '/resolve?url=' + encodeURIComponent(url) + '&client_id=' + clientId);
+  if (r.status === 401 || r.status === 403) {
+    const fresh = await scClientId(true);
+    if (fresh && fresh !== clientId) {
+      clientId = fresh;
+      r = await scJson(SC_API + '/resolve?url=' + encodeURIComponent(url) + '&client_id=' + clientId);
+    }
+  }
+  if (r.status === 404 || (r.j && r.j.errors)) {
+    return json(404, { ok: false, error: 'That SoundCloud link does not exist (or is private)' });
+  }
+  if (r.status !== 200 || !r.j || !r.j.kind) {
+    return json(502, { ok: false, error: 'SoundCloud could not read that link (status ' + r.status + ') — try again' });
+  }
+  const kind = String(r.j.kind);
+
+  /* 3a. single track */
+  if (kind === 'track') {
+    const t = scTrackOut(r.j, 0);
+    if (t.hlsOnly) return json(200, { ok: true, version: VERSION, kind: 'track', list: { title: t.title, user: t.artist, artwork: t.artwork, count: 1 }, tracks: [t], note: 'This track has no direct mp3 stream (HLS only)' });
+    t.mp3 = await scMediaUrlOf(((r.j.media && r.j.media.transcodings) || []).filter(function (x) { return x && x.format && x.format.protocol === 'progressive'; })[0] || { url: '' }, clientId);
+    return json(200, { ok: true, version: VERSION, kind: 'track', list: { title: t.title, user: t.artist, artwork: t.artwork, count: 1 }, tracks: [t] });
+  }
+  if (kind !== 'playlist') {
+    return json(400, { ok: false, error: 'That link is a ' + kind + ' — paste a track, album or playlist link' });
+  }
+
+  /* 3b. playlist / album: hydrate stub tracks (the resolve embeds only the
+     first ~5 full objects; the rest come back as {id,kind,...} stubs and
+     must be fetched via /tracks?ids=…) */
+  let tracks = (r.j.tracks || []).slice();
+  const stubIdx = [];
+  tracks.forEach(function (t, i) { if (!t || !t.media) stubIdx.push(i); });
+  if (stubIdx.length) {
+    const ids = tracks.map(function (t) { return t && t.id; });
+    const chunks = [];
+    for (let c = 0; c < ids.length; c += 50) chunks.push(ids.slice(c, c + 50));
+    const byId = {};
+    for (const ch of chunks) {
+      const rr = await scJson(SC_API + '/tracks?ids=' + ch.join(',') + '&client_id=' + clientId);
+      if (rr.status === 200 && Array.isArray(rr.j)) rr.j.forEach(function (t) { if (t && t.id != null) byId[t.id] = t; });
+    }
+    tracks = ids.map(function (id) { return byId[id] || null; }).filter(Boolean);
+  }
+  if (!tracks.length) return json(200, { ok: true, version: VERSION, kind: 'playlist', list: { title: '', user: '', artwork: scArt(r.j.artwork_url), count: 0 }, tracks: [], note: 'No downloadable tracks on that page' });
+
+  const out = tracks.map(function (t, i) { return scTrackOut(t, i); });
+
+  /* 4. eager mp3 resolution — the window is either the one lazy track or
+     the first maxEager; concurrent pool of 4, one retry each */
+  const want = trackIdx >= 0 ? [Math.min(trackIdx, out.length - 1)] : out.map(function (t, i) { return i; }).slice(0, maxEager);
+  const targets = want.filter(function (i) { return !out[i].hlsOnly; });
+  let done = 0;
+  async function resolveOne(i) {
+    const t = out[i];
+    for (let a = 0; a < 2 && !t.mp3; a++) {
+      if (a) await new Promise(function (rs) { setTimeout(rs, 500); });
+      const tc = (((tracks[i] || {}).media || {}).transcodings || []).filter(function (x) { return x && x.format && x.format.protocol === 'progressive'; })[0];
+      if (!tc) break;
+      t.mp3 = await scMediaUrlOf(tc, clientId);
+    }
+    done++;
+  }
+  const pool = [];
+  const queue = targets.slice();
+  async function worker2() {
+    while (queue.length) { const i = queue.shift(); if (i == null) return; await resolveOne(i); }
+  }
+  for (let w = 0; w < 4 && w < targets.length; w++) pool.push(worker2());
+  await Promise.all(pool);
+
+  return json(200, {
+    ok: true,
+    version: VERSION,
+    kind: 'playlist',
+    list: { title: String((r.j.title || '')).slice(0, 160), user: String((r.j.user && r.j.user.username) || '').slice(0, 120), artwork: scArt(r.j.artwork_url), count: out.length },
+    tracks: out,
+    lazy: out.filter(function (t) { return !t.mp3 && !t.hlsOnly; }).length
+  });
+}
+
 async function handle(req, event) {
   const u = new URL(req.url);
 
@@ -621,6 +808,26 @@ async function handle(req, event) {
     if (req.method === 'OPTIONS') return cors204(req);
     try { return await aplHandle(u); } catch (eApl) {
       return json(502, { ok: false, error: 'apl flow failed: ' + String((eApl && eApl.message) || eApl).slice(0, 160) });
+    }
+  }
+
+  /* ---- SoundCloud grabber: GET /__relay/sc?url=<soundcloud link>[&track=N][&max=M]
+     sclouddownloader.net's own playlist backend has been dead for a while
+     (its server cannot reach SoundCloud — every playlist POST lands on
+     /playlist-error, even in a plain browser), so Relay runs the flow
+     natively against SoundCloud's public API: client_id scraped from the
+     web bundles (cached 12h per isolate), /resolve the pasted link,
+     hydrate stub tracks via /tracks?ids=, then turn each track's
+     progressive transcoding into a signed media URL (cf-media.sndcdn.com,
+     URL-authenticated + CORS *, so the phone itself can fetch it — the
+     app routes the save through this worker anyway for the attachment
+     header). No session binding, so unlike /__relay/apl there is nothing
+     that pins the chain to one invocation except the subrequest budget
+     (default eager 24, cap 30; lazy &track=N re-runs the cheap steps). */
+  if (u.pathname === '/__relay/sc') {
+    if (req.method === 'OPTIONS') return cors204(req);
+    try { return await scHandle(u); } catch (eSc) {
+      return json(502, { ok: false, error: 'SoundCloud flow failed: ' + String((eSc && eSc.message) || eSc).slice(0, 160) });
     }
   }
 
