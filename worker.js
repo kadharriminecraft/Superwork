@@ -74,6 +74,13 @@
        pasted URL, hydrate stub tracks via /tracks?ids=, then resolve each
        track's progressive transcoding into a signed cf-media mp3 link
        (URL-authenticated, CORS-open, works from any IP incl. the phone)
+     - v2.9: the path-marker repair (v2.1) now ALSO writes DIRECTORY-prefix
+       markers and the targetless lookup walks UP the path — a lazy chunk
+       that was never itself served with a target (/assets/chunks/x.js,
+       VitePress page-data) used to miss the exact-only marker and answer
+       400, and the SPA rendered its own "not found" page. This is the
+       fmhy.net "404 sometimes, fine other times" bug: pages whose chunks
+       were preloaded worked, first-visit dynamic imports died.
 
    URL shapes accepted (all equivalent):
      https://YOUR.WORKER/?url=https://example.com/      (encoded or raw)
@@ -81,7 +88,7 @@
      https://YOUR.WORKER/https://example.com/           (path style)
    ===================================================================== */
 
-const VERSION = '2.8';
+const VERSION = '2.9';
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const HOP_LIMIT = 10;
@@ -763,7 +770,10 @@ async function scHandle(u) {
     ok: true,
     version: VERSION,
     kind: 'playlist',
-    list: { title: String((r.j.title || '')).slice(0, 160), user: String((r.j.user && r.j.user.username) || '').slice(0, 120), artwork: scArt(r.j.artwork_url), count: out.length },
+    /* many playlists never set their own artwork — the first track's cover
+       is what the set page shows, so fall through to it (v2.9: the album
+       ZIP needs SOME cover to pack as folder.jpg) */
+    list: { title: String((r.j.title || '')).slice(0, 160), user: String((r.j.user && r.j.user.username) || '').slice(0, 120), artwork: scArt(r.j.artwork_url) || ((out.find(function (t) { return t.artwork; }) || {}).artwork || ''), count: out.length },
     tracks: out,
     lazy: out.filter(function (t) { return !t.mp3 && !t.hlsOnly; }).length
   });
@@ -1187,9 +1197,24 @@ async function handle(req, event) {
        site's asset tree each served path belonged to ("path marker"),
        and redirects the targetless request back to the mapped URL. */
     if (req.method === 'GET' && !/^\/(__relay|healthz|favicon)/i.test(u.pathname)) {
+      /* v2.9: prefix-walk. Exact match first (v2.1 behavior), then parent
+         directories: /assets/page-data/en/x.json -> /assets/page-data/en/
+         -> /assets/page-data/ -> /assets/. ES dynamic import() resolves
+         root-relative specifiers against the PROXY origin, and the lazily
+         imported chunk was often NEVER served with a target before (only
+         entry chunks are), so the exact-only lookup missed, answered 400,
+         and the SPA rendered its own "not found" page — fmhy.net loaded
+         fine on preloaded pages and 404'd on first-visit navigations. The
+         write side below now also plants directory-prefix markers, so the
+         walk-up finds the site that owns the asset tree. Keys are
+         path-only (query-insensitive), same as the writes. */
       try {
-        const marker = await caches.default.match(stripRange(req));
-        if (marker) {
+        const segs = u.pathname.split('/').filter(Boolean);
+        const cands = [u.pathname];
+        for (let wi = segs.length - 1; wi >= 1; wi--) cands.push('/' + segs.slice(0, wi).join('/') + '/');
+        for (const wp of cands) {
+          const marker = await caches.default.match(new Request(u.origin + wp, { method: 'GET' }));
+          if (!marker) continue;
           const site = (await marker.text()).trim();
           if (/^https?:\/\/[a-z0-9.-]+/i.test(site)) {
             const dest = u.origin + '/' + site + u.pathname + u.search;
@@ -1202,6 +1227,7 @@ async function handle(req, event) {
                 'access-control-allow-headers': 'Content-Type, Range',
                 'cache-control': 'no-store',
                 'x-relay-path-redirect': '1',
+                'x-relay-marker': (wp === u.pathname ? 'exact' : 'prefix ' + wp),
                 'x-relay-version': VERSION
               }
             });
@@ -1529,11 +1555,15 @@ async function handle(req, event) {
     }
   }
 
-  /* ---- path-marker write: remember site → bare path (v2.1) ----
+  /* ---- path-marker write: remember site → bare path (v2.1) ----------------
      Whenever a site's JS/CSS is served, record that this PATH belongs to
      that site's asset tree, so the targetless "/assets/..." module
      requests above can be redirected back to the right URL. Key = the
-     exact targetless request URL; value = the site origin; TTL 30 min. **/
+     exact targetless request URL; value = the site origin; TTL 30 min.
+     v2.9: ALSO plant DIRECTORY-prefix markers (deepest two levels, 15-min
+     TTL) so the prefix-walk read above can map lazy chunks and page-data
+     files that were never served with a target of their own — the
+     fmhy.net "404 on first visit, fine afterwards" fix. **/
   let markerDebug = 'none';
   if (method === 'GET' && res.status === 200 && !dlMode) {
     try {
@@ -1542,11 +1572,20 @@ async function handle(req, event) {
       if (isAsset && /^\/https?:\/+/i.test(u.pathname)) {
         markerDebug = 'asset ' + ct.slice(0, 25);
         const tp = new URL(finalUrl);
-        const markerKey = new Request(u.origin + tp.pathname, { method: 'GET' });
-        const markerVal = new Response(tp.origin, {
-          headers: { 'cache-control': 'max-age=1800' }
-        });
-        const putP = caches.default.put(markerKey, markerVal).then(() => { markerDebug = 'wrote ' + tp.pathname; }, () => { markerDebug = 'putfail'; });
+        const puts = [];
+        puts.push(caches.default.put(
+          new Request(u.origin + tp.pathname, { method: 'GET' }),
+          new Response(tp.origin, { headers: { 'cache-control': 'max-age=1800' } })
+        ));
+        const msegs = tp.pathname.split('/').filter(Boolean);
+        for (let mi = Math.min(2, msegs.length - 1); mi >= 1; mi--) {
+          const pdir = '/' + msegs.slice(0, mi).join('/') + '/';
+          puts.push(caches.default.put(
+            new Request(u.origin + pdir, { method: 'GET' }),
+            new Response(tp.origin, { headers: { 'cache-control': 'max-age=900' } })
+          ));
+        }
+        const putP = Promise.all(puts).then(() => { markerDebug = 'wrote ' + tp.pathname; }, () => { markerDebug = 'putfail'; });
         if (event && event.waitUntil) { try { event.waitUntil(putP); } catch (eW) {} }
       }
     } catch (eMW) { markerDebug = 'err ' + String(eMW); }
