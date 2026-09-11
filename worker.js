@@ -88,7 +88,7 @@
      https://YOUR.WORKER/https://example.com/           (path style)
    ===================================================================== */
 
-const VERSION = '2.9';
+const VERSION = '2.10';
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const HOP_LIMIT = 10;
@@ -1480,6 +1480,63 @@ async function handle(req, event) {
   if (method === 'GET' && res.status === 200 && !dlMode) {
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     const isJs = /javascript|ecmascript/.test(ct) || /\.mjs$/i.test(new URL(finalUrl).pathname);
+    const isCss = /text\/css/.test(ct) || /\.css($|\?)/i.test(new URL(finalUrl).pathname);
+    /* ---- v2.10: CSS body re-root --------------------------------------
+       A stylesheet the iframe loads through this worker arrives with its
+       @imports, url() fonts and url() images still pointing DIRECTLY at
+       their CDNs — on a filtered network every one of those dies (fonts
+       first: the page "works" but looks nothing like itself; scp-wiki's
+       sigma theme imports rsms.me/maxcdn/wdfiles font CSS and 6+ svg/png
+       refs off cdn.scpwiki.com). Rewrite every referenceable URL in served
+       CSS to a worker rawpath URL: relative refs resolve against the
+       FINAL upstream URL (after redirects — cdn.scpwiki.com 301s to a
+       DigitalOcean Spaces origin), absolute http(s) refs are prefixed,
+       data:/blob:/#/about: refs are left alone. The client pipeline knows
+       to leave worker-prefixed refs untouched (cssAlreadyProxied), so
+       fetched-and-inlined sheets never double-prefix. Two passes with the
+       same already-prefixed guard the client uses: the url() pass rewrites
+       imports' inner url(), the @import pass only sees (and skips) its own
+       output. Cap 2MB, skip when already patched (edge-cached bodies carry
+       the marker header). */
+    if (isCss && !isJs && !res.headers.get('x-relay-css-patch')) {
+      try {
+        const cssTxt = await res.text();
+        if (cssTxt && cssTxt.length < 2 * 1024 * 1024) {
+          const wOrigin = u.origin;
+          const cssBase = finalUrl;
+          const isPrefixed = (s) => s.startsWith(wOrigin + '/');
+          const skipRef = (s) => !s || /^(data:|blob:|about:|#)/i.test(s) || isPrefixed(s);
+          const reRoot = (raw) => {
+            try {
+              const abs2 = new URL(raw, cssBase).href;
+              if (!/^https?:/i.test(abs2)) return null;
+              return wOrigin + '/' + abs2;
+            } catch (eU) { return null; }
+          };
+          let patched = cssTxt.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/g, (m, q, raw) => {
+            if (skipRef(raw)) return m;
+            const nu = reRoot(raw);
+            return nu ? 'url("' + nu.replace(/"/g, '%22') + '")' : m;
+          });
+          patched = patched.replace(/@import\s+(?:url\(\s*)?(['"])([^'")]+)\1/gi, (m, q, raw) => {
+            if (skipRef(raw)) return m;
+            const nu = reRoot(raw);
+            return nu ? '@import url("' + nu.replace(/"/g, '%22') + '")' : m;
+          });
+          const hdrsC = new Headers();
+          res.headers.forEach((v, k) => { hdrsC.set(k, v); });
+          hdrsC.delete('content-length');
+          if (patched !== cssTxt) hdrsC.set('x-relay-css-patch', '1');
+          res = new Response(patched, { status: res.status, statusText: res.statusText, headers: hdrsC });
+        } else if (cssTxt) {
+          /* oversized — rebuild from the drained text unchanged */
+          const hdrsC0 = new Headers();
+          res.headers.forEach((v, k) => { hdrsC0.set(k, v); });
+          hdrsC0.delete('content-length');
+          res = new Response(cssTxt, { status: res.status, statusText: res.statusText, headers: hdrsC0 });
+        }
+      } catch (eCss) { /* body unreadable — serve as-is */ }
+    }
     if (isJs && !res.headers.get('x-relay-js-patch')) {
       try {
         /* NOTE: reading text() disturbs res.body — the response is ALWAYS
