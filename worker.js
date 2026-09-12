@@ -92,6 +92,15 @@
        browser's 6-connections-per-host limit, starve every other
        subresource on the page — the "site half-loads then everything
        vanishes" family of failures.
+     - v2.12: JS location-patch no longer emits invalid assignments. The
+       bare-token rule wrapped `window.location = X` into
+       `(cond?a:b) = X` — a syntax error that killed ENTIRE bundles at
+       parse time (Steam's storefront: 4 scripts died, GHomepage never
+       defined, homepage rendered blank with only server-side capsules;
+       any site with a plain location jump in its JS was affected). The
+       rule now uses a replace callback that leaves the token raw whenever
+       an assignment operator follows. CACHE_KEY_VER bumped rl2 → rl3 so
+       every poisoned edge-cached bundle is orphaned.
 
    URL shapes accepted (all equivalent):
      https://YOUR.WORKER/?url=https://example.com/      (encoded or raw)
@@ -99,7 +108,7 @@
      https://YOUR.WORKER/https://example.com/           (path style)
    ===================================================================== */
 
-const VERSION = '2.11';
+const VERSION = '2.12';
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const HOP_LIMIT = 10;
@@ -1598,9 +1607,32 @@ async function handle(req, event) {
                  `.` member (rule 1's territory), identifier chars, `(`, and
                  arithmetic/assignment ops (never a value read); the `:`
                  lookbehind stops this rule from re-wrapping rule 1's own
-                 output (`…:window.location)`). */
-              /(?<![.\w$:])(?:window|document)\.location(?![.\w$(=+\-*%\[])/g,
-              '(window.__rlLoc?window.__rlLoc():window.location)'
+                 output (`…:window.location)`).
+                 v2.12 CRITICAL FIX: `window.location = X` (assignment, any
+                 whitespace before the =) used to wrap into
+                 `(cond?a:b) = X` — an INVALID left-hand side — which broke
+                 the WHOLE file at parse time. store.steampowered.com lost
+                 shared_global.js, main.js, home.js and
+                 shared_responsive_adapter.js this way (GHomepage never
+                 defined → the storefront rendered as a blank scrolling
+                 shell with only a few server-side capsules). The char
+                 lookahead only sees the space after the token, so the `=`
+                 one whitespace away was invisible. A replace CALLBACK now
+                 inspects what actually follows and leaves the token RAW
+                 whenever an assignment operator is ahead — raw is always
+                 safe (it is exactly what the origin sent, and a raw
+                 location assignment still navigates, which the runtime's
+                 pagehide escape sentinel re-captures). */
+              /(?<![.\w$:])(?:window|document)\.location(?![.\w$(=+\-*%])/g,
+              function (m, off, whole) {
+                try {
+                  const rest = whole.slice(off + m.length);
+                  /* plain or compound assignment ahead (==/===/=> are NOT
+                     assignments — those wrap harmlessly) → never touch it */
+                  if (/^\s*(?:[+\-*/%&|^]|<<|>>>?|&&|\|\||\?\?)?=(?![=>])/.test(rest)) return m;
+                } catch (eCb) { return m; }
+                return '(window.__rlLoc?window.__rlLoc():window.location)';
+              }
             );
           }
           /* always rebuild: text() drained the original body */
@@ -1726,7 +1758,7 @@ async function handle(req, event) {
    so real bytes land in the cache. A version tag in the key orphans every
    entry the old code poisoned (some origins sent year-long max-ages, so
    stale junk could otherwise outlive the fix). */
-const CACHE_KEY_VER = 'rl2';
+const CACHE_KEY_VER = 'rl3';
 function eventPut(cache, req, res, finalUrl, event) {
   try {
     const cl = res.clone ? res.clone() : null;
