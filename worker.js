@@ -81,6 +81,17 @@
        400, and the SPA rendered its own "not found" page. This is the
        fmhy.net "404 sometimes, fine other times" bug: pages whose chunks
        were preloaded worked, first-visit dynamic imports died.
+     - v2.10: CSS body re-root — every url()/@import inside a SERVED
+       stylesheet is rewritten to a worker URL (relative refs resolve
+       against the final upstream URL after redirects), so a theme loaded
+       through the worker no longer points its fonts/images DIRECTLY at
+       CDNs the phone cannot reach (scp-wiki sigma theme).
+     - v2.11: tiered upstream timeouts — document loads keep the 40s budget,
+       every other resource aborts at 22s. A hanging upstream on a head
+       stylesheet used to freeze the parser (blank page) AND, with the
+       browser's 6-connections-per-host limit, starve every other
+       subresource on the page — the "site half-loads then everything
+       vanishes" family of failures.
 
    URL shapes accepted (all equivalent):
      https://YOUR.WORKER/?url=https://example.com/      (encoded or raw)
@@ -88,11 +99,19 @@
      https://YOUR.WORKER/https://example.com/           (path style)
    ===================================================================== */
 
-const VERSION = '2.10';
+const VERSION = '2.11';
 const UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const UA_MOBILE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
 const HOP_LIMIT = 10;
 const FETCH_TIMEOUT_MS = 40000;
+/* v2.11: render-blocking subresources (css/js/img/font) get a much tighter
+   budget than documents. A hanging upstream on a head stylesheet froze the
+   WHOLE page (parser blocked, blank screen) for the full 40s — and with 6
+   per-host connections, a few hangers starved the browser's pool for every
+   OTHER resource too (the "loads then disappears" family). 22s is long
+   enough for slow CDNs, short enough to unblock the page quickly; doc loads
+   keep the full 40s. */
+const ASSET_TIMEOUT_MS = 22000;
 
 /* Headers we never forward back to the browser (they break rendering or
    are meaningless through a proxy) */
@@ -1387,7 +1406,13 @@ async function handle(req, event) {
      win on the next request via the X-Relay-Cookie merge. */
   const scRelay = [];
   const ctrl = new AbortController();
-  const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, FETCH_TIMEOUT_MS);
+  /* v2.11: tiered timeouts — a doc-hinted navigation keeps the 40s budget;
+     every other resource (css/js/img/font/xhr) aborts at 22s so one hanging
+     upstream can no longer freeze the whole page + the browser's connection
+     pool. Retries for transient statuses still happen inside that budget. */
+  const hintEarly = (req.headers.get('x-relay-hint') || '').toLowerCase();
+  const timerBudget = (hintEarly === 'doc' || dlMode) ? FETCH_TIMEOUT_MS : ASSET_TIMEOUT_MS;
+  const timer = setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timerBudget);
   try {
     let next = target;
     while (hops <= HOP_LIMIT) {
